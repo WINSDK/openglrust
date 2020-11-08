@@ -1,11 +1,24 @@
 /// Requires shaderc library to be installed => https://github.com/google/shaderc
+
 extern crate shaderc;
 
+use shaderc::ShaderKind;
 use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
     renderwindow()?;
     Ok(())
+}
+
+/// Compiles glsl shader to SPIR-V required for gfx_hal
+fn compileshader(shader: &str, shader_name: &str, shader_kind: ShaderKind) -> Vec<u32> {
+    let mut compiler = shaderc::Compiler::new()
+        .unwrap_or_else(|| panic!("Failed to compile shader: {:?}", shader_kind));
+
+    let compiled_shader = compiler.compile_into_spirv(shader, shader_kind, shader_name, "main", None)
+        .unwrap_or_else(|error| panic!("Failed to compile shader: {}", error));
+
+    compiled_shader.as_binary().to_vec()
 }
 
 // TODO: create a struct to statically handle error's instead of boxing them.
@@ -15,7 +28,6 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
         window::{Extent2D, PresentationSurface, Surface},
         Instance,
     };
-    use shaderc::ShaderKind;
 
     const WINDOW_TITLE: &str = "Sample text";
     const WINDOW_SIZE: [u32; 2] = [2160, 3840];
@@ -81,6 +93,69 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
         let command_buffer = command_pool.allocate_one(Level::Primary);
 
         (command_pool, command_buffer)
+    };
+
+    let surface_color_format = {
+        use gfx_hal::format::{ChannelType, Format};
+
+        let supported_formats = surface
+            .supported_formats(&adapter.physical_device)
+            .unwrap_or(vec![]);
+
+        let default_format = *supported_formats.get(0).unwrap_or(&Format::Rgba8Srgb);
+
+        supported_formats
+            .into_iter()
+            .find(|format| format.base_format().1 == ChannelType::Srgb)
+            .unwrap_or(default_format)
+    };
+
+    let render_pass = {
+        use gfx_hal::image::Layout;
+        use gfx_hal::pass::{
+            Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc,
+        };
+
+        let color_attachment = Attachment {
+            format: Some(surface_color_format),
+            samples: 1,
+            ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
+            stencil_ops: AttachmentOps::DONT_CARE,
+            layouts: Layout::Undefined..Layout::Present,
+        };
+
+        // colors: is refering to the first index of the list of attachments
+        // passed into create_render_pass.
+        let subpass = SubpassDesc {
+            colors: &[(0, Layout::ColorAttachmentOptimal)],
+            depth_stencil: None,
+            inputs: &[],
+            resolves: &[],
+            preserves: &[],
+        };
+
+        unsafe {
+            device
+                .create_render_pass(&[color_attachment], &[subpass], &[])
+                .expect("Out of memory");
+        }
+    };
+
+    // This defines textures and matrices required by the shaders, not required for
+    // the simple shaders i'm using right now.
+    let pipeline_layout = unsafe {
+        device
+            .create_pipeline_layout(&[], &[])
+            .expect("Out of memory")
+    };
+
+    let (vertex_shader, fragment_shader) = {
+        let options: &str = include_str!("shaders/options.glsl");
+
+        let vertex_shader = format!("{}\n{}", options, include_str!("shaders/vertex.glsl"));
+        let fragment_shader = format!("{}\n{}", options, include_str!("shaders/fragment.glsl"));
+
+        (vertex_shader, fragment_shader)
     };
 
     // The swapchain is a chain of images to render onto.

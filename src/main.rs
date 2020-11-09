@@ -1,7 +1,7 @@
 /// Requires shaderc library to be installed => https://github.com/google/shaderc
-
 extern crate shaderc;
 
+use gfx_hal::device::Device;
 use shaderc::ShaderKind;
 use std::error::Error;
 
@@ -10,12 +10,88 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Create a pipeline with the given layout and shaders.
+unsafe fn pipeline<T: gfx_hal::Backend>(
+    device: &T::Device,
+    render_pass: &T::RenderPass,
+    pipeline_layout: &T::PipelineLayout,
+    vertex_shader: &str,
+    fragment_shader: &str,
+) -> T::GraphicsPipeline {
+    use gfx_hal::pass::Subpass;
+    use gfx_hal::pso::{
+        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
+        InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Specialization,
+    };
+
+    let vertex_shader_module = device
+        .create_shader_module(&compileshader(vertex_shader, "Vertex", ShaderKind::Vertex))
+        .expect("Failed to create vertex shader module");
+
+    let fragment_shader_module = device
+        .create_shader_module(&compileshader(
+            fragment_shader,
+            "Vertex",
+            ShaderKind::Fragment,
+        ))
+        .expect("Failed to create vertex shader module");
+
+    let vs_entry = EntryPoint {
+        entry: "pipeline()",
+        module: &vertex_shader_module,
+        specialization: Specialization::default(),
+    };
+
+    let fs_entry = EntryPoint {
+        entry: "pipeline()",
+        module: &fragment_shader_module,
+        specialization: Specialization::default(),
+    };
+
+    let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
+        buffers: &[],
+        attributes: &[],
+        input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+        vertex: vs_entry,
+        tessellation: None,
+        geometry: None,
+    };
+
+    let mut pipeline_desc = GraphicsPipelineDesc::new(
+        primitive_assembler,
+        Rasterizer {
+            cull_face: Face::BACK,
+            ..Rasterizer::FILL
+        },
+        Some(fs_entry),
+        pipeline_layout,
+        Subpass {
+            index: 0,
+            main_pass: render_pass,
+        },
+    );
+
+    pipeline_desc.blender.targets.push(ColorBlendDesc {
+        mask: ColorMask::ALL,
+        blend: Some(BlendState::ALPHA),
+    });
+
+    let pipeline = device
+        .create_graphics_pipeline(&pipeline_desc, None)
+        .expect("Failed to create graphics pipeline");
+    device.destroy_shader_module(vertex_shader_module);
+    device.destroy_shader_module(fragment_shader_module);
+
+    pipeline
+}
+
 /// Compiles glsl shader to SPIR-V required for gfx_hal
 fn compileshader(shader: &str, shader_name: &str, shader_kind: ShaderKind) -> Vec<u32> {
     let mut compiler = shaderc::Compiler::new()
         .unwrap_or_else(|| panic!("Failed to compile shader: {:?}", shader_kind));
 
-    let compiled_shader = compiler.compile_into_spirv(shader, shader_kind, shader_name, "main", None)
+    let compiled_shader = compiler
+        .compile_into_spirv(shader, shader_kind, shader_name, "compileshader()", None)
         .unwrap_or_else(|error| panic!("Failed to compile shader: {}", error));
 
     compiled_shader.as_binary().to_vec()
@@ -24,7 +100,6 @@ fn compileshader(shader: &str, shader_name: &str, shader_kind: ShaderKind) -> Ve
 // TODO: create a struct to statically handle error's instead of boxing them.
 pub fn renderwindow() -> Result<(), Box<dyn Error>> {
     use gfx_hal::{
-        device::Device,
         window::{Extent2D, PresentationSurface, Surface},
         Instance,
     };
@@ -150,12 +225,24 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
     };
 
     let (vertex_shader, fragment_shader) = {
-        let options: &str = include_str!("shaders/options.glsl");
+        let options = include_str!("../shaders/options.glsl");
 
-        let vertex_shader = format!("{}\n{}", options, include_str!("shaders/vertex.glsl"));
-        let fragment_shader = format!("{}\n{}", options, include_str!("shaders/fragment.glsl"));
+        let vertex_shader: &str =
+            &[options, "\n", include_str!("../shaders/vertex.glsl")].concat()[..];
+        let fragment_shader: &str =
+            &[options, "\n", include_str!("../shaders/fragment.glsl")].concat()[..];
 
         (vertex_shader, fragment_shader)
+    };
+
+    let pipeline = unsafe {
+        pipeline::<backend::Backend>(
+            &device,
+            &render_pass,
+            &pipeline_layout,
+            vertex_shader,
+            fragment_shader,
+        )
     };
 
     // The swapchain is a chain of images to render onto.

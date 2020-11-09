@@ -4,14 +4,83 @@ extern crate shaderc;
 use gfx_hal::device::Device;
 use shaderc::ShaderKind;
 use std::error::Error;
+use std::mem::ManuallyDrop;
 
 fn main() -> Result<(), Box<dyn Error>> {
     renderwindow()?;
     Ok(())
 }
 
+pub struct GpuResources<Backend: gfx_hal::Backend> {
+    instance: Backend::Instance,
+    surface: Backend::Surface,
+    device: Backend::Device,
+    render_passes: Vec<Backend::RenderPass>,
+    pipeline_layouts: Vec<Backend::PipelineLayout>,
+    pipelines: Vec<Backend::GraphicsPipeline>,
+    command_pool: Backend::CommandPool,
+    submission_fence: Backend::Fence,
+    rendering_semaphore: Backend::Semaphore,
+}
+
+// Required because drop requires &mut self whilst destroy..() in gfx_hal takes exclusive ownership
+// of the object through self.
+struct ResourceHolder<Backend: gfx_hal::Backend>(ManuallyDrop<GpuResources<Backend>>);
+
+impl<Backend: gfx_hal::Backend> Drop for ResourceHolder<Backend> {
+    fn drop(&mut self) {
+        unsafe {
+            use gfx_hal::window::PresentationSurface;
+            use gfx_hal::Instance;
+
+            let GpuResources {
+                instance,
+                mut surface,
+                device,
+                render_passes,
+                pipeline_layouts,
+                pipelines,
+                command_pool,
+                submission_fence,
+                rendering_semaphore,
+            } = ManuallyDrop::take(&mut self.0);
+
+            device.destroy_semaphore(rendering_semaphore);
+            device.destroy_fence(submission_fence);
+            for pipeline in pipelines {
+                device.destroy_graphics_pipeline(pipeline);
+            }
+            for pipeline_layout in pipeline_layouts {
+                device.destroy_pipeline_layout(pipeline_layout);
+            }
+            for render_pass in render_passes {
+                device.destroy_render_pass(render_pass);
+            }
+            device.destroy_command_pool(command_pool);
+            surface.unconfigure_swapchain(&device);
+            instance.destroy_surface(surface);
+        }
+    }
+}
+fn read_shader(path: &str, default_options: bool) -> String {
+    use std::fs;
+
+    let mut objects: Vec<u8> = Vec::new();
+
+    if default_options {
+        objects.append(&mut fs::read(path).unwrap());
+        objects.append(&mut fs::read("../shaders/vertex.glsl").unwrap());
+
+        String::from_utf8(objects).expect("Failed to parse utf-8 sequence")
+    } else {
+        objects.append(&mut fs::read("../shaders/vertex.glsl").unwrap());
+
+        String::from_utf8(objects).expect("Failed to parse utf-8 sequence")
+    }
+}
+
 /// Create a pipeline with the given layout and shaders.
-unsafe fn pipeline<T: gfx_hal::Backend>(
+pub unsafe fn generate_pipeline<T: gfx_hal::Backend>(
     device: &T::Device,
     render_pass: &T::RenderPass,
     pipeline_layout: &T::PipelineLayout,
@@ -25,11 +94,11 @@ unsafe fn pipeline<T: gfx_hal::Backend>(
     };
 
     let vertex_shader_module = device
-        .create_shader_module(&compileshader(vertex_shader, "Vertex", ShaderKind::Vertex))
+        .create_shader_module(&compile_shader(vertex_shader, "Vertex", ShaderKind::Vertex))
         .expect("Failed to create vertex shader module");
 
     let fragment_shader_module = device
-        .create_shader_module(&compileshader(
+        .create_shader_module(&compile_shader(
             fragment_shader,
             "Vertex",
             ShaderKind::Fragment,
@@ -86,12 +155,12 @@ unsafe fn pipeline<T: gfx_hal::Backend>(
 }
 
 /// Compiles glsl shader to SPIR-V required for gfx_hal
-fn compileshader(shader: &str, shader_name: &str, shader_kind: ShaderKind) -> Vec<u32> {
+pub fn compile_shader(shader: &str, shader_name: &str, shader_kind: ShaderKind) -> Vec<u32> {
     let mut compiler = shaderc::Compiler::new()
         .unwrap_or_else(|| panic!("Failed to compile shader: {:?}", shader_kind));
 
     let compiled_shader = compiler
-        .compile_into_spirv(shader, shader_kind, shader_name, "compileshader()", None)
+        .compile_into_spirv(shader, shader_kind, shader_name, "compile_shader()", None)
         .unwrap_or_else(|error| panic!("Failed to compile shader: {}", error));
 
     compiled_shader.as_binary().to_vec()
@@ -191,7 +260,7 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
             Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, SubpassDesc,
         };
 
-        let color_attachment = Attachment {
+        let attachment = Attachment {
             format: Some(surface_color_format),
             samples: 1,
             ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store),
@@ -209,11 +278,8 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
             preserves: &[],
         };
 
-        unsafe {
-            device
-                .create_render_pass(&[color_attachment], &[subpass], &[])
-                .expect("Out of memory");
-        }
+        unsafe { device.create_render_pass(&[attachment], &[subpass], &[]) }
+            .expect("Failed to create render pass, possibly out of memory")
     };
 
     // This defines textures and matrices required by the shaders, not required for
@@ -224,26 +290,31 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
             .expect("Out of memory")
     };
 
-    let (vertex_shader, fragment_shader) = {
-        let options = include_str!("../shaders/options.glsl");
-
-        let vertex_shader: &str =
-            &[options, "\n", include_str!("../shaders/vertex.glsl")].concat()[..];
-        let fragment_shader: &str =
-            &[options, "\n", include_str!("../shaders/fragment.glsl")].concat()[..];
-
-        (vertex_shader, fragment_shader)
-    };
-
     let pipeline = unsafe {
-        pipeline::<backend::Backend>(
+        generate_pipeline::<backend::Backend>(
             &device,
             &render_pass,
             &pipeline_layout,
-            vertex_shader,
-            fragment_shader,
+            &read_shader("../shaders/vertex.glsl", true)[..],
+            &read_shader("../shaders/fragment.glsl", true)[..],
         )
     };
+
+    let submission_fence = device.create_fence(true).expect("Out of memory");
+    let rendering_semaphore = device.create_semaphore().expect("Out of memory");
+
+    let mut resource_container: ResourceHolder<backend::Backend> =
+        ResourceHolder(ManuallyDrop::new(GpuResources {
+            instance,
+            surface,
+            device,
+            command_pool,
+            render_passes: vec![render_pass],
+            pipeline_layouts: vec![pipeline_layout],
+            pipelines: vec![pipeline],
+            submission_fence,
+            rendering_semaphore,
+        }));
 
     // The swapchain is a chain of images to render onto.
     let mut configure_swapchain = true;
@@ -277,7 +348,145 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
                 window.request_redraw();
             }
             // TODO: Rendering logic implementation
-            Event::RedrawRequested(_) => {}
+            Event::RedrawRequested(_) => {
+                // Timout to prevent 'hanging' of the image.
+                const TIMOUT: u64 = 1_000_000_000;
+
+                let resources: &mut GpuResources<_> = &mut resource_container.0;
+                //let render_pass = &resources.render_passes[0];
+                //let pipeline = &resources.pipelines[0];
+
+                unsafe {
+                    use gfx_hal::pool::CommandPool;
+
+                    resources
+                        .device
+                        .wait_for_fence(&resources.submission_fence, TIMOUT)
+                        .expect("Failed to wait for fence");
+
+                    resources
+                        .device
+                        .reset_fence(&resources.submission_fence)
+                        .expect("Out of memory");
+
+                    resources.command_pool.reset(false);
+                }
+
+                if configure_swapchain {
+                    use gfx_hal::pso as Dimensions;
+                    use gfx_hal::window::SwapchainConfig;
+
+                    let caps = resources.surface.capabilities(&adapter.physical_device);
+
+                    let swapchain_config =
+                        SwapchainConfig::from_caps(&caps, surface_color_format, surface_extent);
+
+                    /*
+                    MacOS fullscreen shutdown fix
+                    if caps.image_count.contains(&3) {
+                        swapchain_config.image_count = 3;
+                    }
+                    */
+
+                    surface_extent = swapchain_config.extent;
+
+                    unsafe {
+                        resources
+                            .surface
+                            .configure_swapchain(&resources.device, swapchain_config)
+                            .expect("Failed to configure swapchain");
+                    };
+
+                    configure_swapchain = false;
+
+                    let surface_image = unsafe {
+                        match resources.surface.acquire_image(TIMOUT) {
+                            Ok((image, _)) => image,
+                            Err(_) => {
+                                configure_swapchain = true;
+                                return;
+                            }
+                        }
+                    };
+
+                    let framebuffer = unsafe {
+                        use gfx_hal::image::Extent;
+                        use std::borrow::Borrow;
+
+                        resources
+                            .device
+                            .create_framebuffer(
+                                &resources.render_passes[0],
+                                vec![surface_image.borrow()],
+                                Extent {
+                                    width: surface_extent.width,
+                                    height: surface_extent.height,
+                                    depth: 1,
+                                },
+                            )
+                            .unwrap()
+                    };
+
+                    let viewport = Dimensions::Viewport {
+                        rect: Dimensions::Rect {
+                            x: 0,
+                            y: 0,
+                            w: surface_extent.width as i16,
+                            h: surface_extent.height as i16,
+                        },
+                        depth: 0.0..1.0,
+                    };
+                    unsafe {
+                        use gfx_hal::command::{
+                            ClearColor, ClearValue, CommandBuffer, CommandBufferFlags,
+                            SubpassContents,
+                        };
+                        use gfx_hal::queue::{CommandQueue, Submission};
+
+                        command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+
+                        command_buffer.set_viewports(0, &[viewport.clone()]);
+                        command_buffer.set_scissors(0, &[viewport.rect]);
+
+                        command_buffer.begin_render_pass(
+                            &resources.render_passes[0],
+                            &framebuffer,
+                            viewport.rect,
+                            &[ClearValue {
+                                color: ClearColor {
+                                    float32: [0.0, 0.0, 0.0, 1.0],
+                                },
+                            }],
+                            SubpassContents::Inline,
+                        );
+
+                        command_buffer.bind_graphics_pipeline(&resources.pipelines[0]);
+
+                        command_buffer.draw(0..0, 0..1);
+
+                        command_buffer.end_render_pass();
+                        command_buffer.finish();
+
+                        let submission = Submission {
+                            command_buffers: vec![&command_buffer],
+                            wait_semaphores: None,
+                            signal_semaphores: vec![&resources.rendering_semaphore],
+                        };
+
+                        queue_group.queues[0].submit(submission, Some(&resources.submission_fence));
+
+                        let result = queue_group.queues[0].present(
+                            &mut resources.surface,
+                            surface_image,
+                            Some(&resources.rendering_semaphore),
+                        );
+
+                        configure_swapchain |= result.is_err();
+
+                        resources.device.destroy_framebuffer(framebuffer);
+                    };
+                };
+            }
             _ => (),
         }
     });

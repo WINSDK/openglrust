@@ -11,23 +11,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub struct GpuResources<Backend: gfx_hal::Backend> {
-    instance: Backend::Instance,
-    surface: Backend::Surface,
-    device: Backend::Device,
-    render_passes: Vec<Backend::RenderPass>,
-    pipeline_layouts: Vec<Backend::PipelineLayout>,
-    pipelines: Vec<Backend::GraphicsPipeline>,
-    command_pool: Backend::CommandPool,
-    submission_fence: Backend::Fence,
-    rendering_semaphore: Backend::Semaphore,
+pub struct GpuResources<B: gfx_hal::Backend> {
+    instance: B::Instance,
+    surface: B::Surface,
+    device: B::Device,
+    render_passes: Vec<B::RenderPass>,
+    pipeline_layouts: Vec<B::PipelineLayout>,
+    pipelines: Vec<B::GraphicsPipeline>,
+    command_pool: B::CommandPool,
+    submission_fence: B::Fence,
+    rendering_semaphore: B::Semaphore,
 }
 
 // Required because drop requires &mut self whilst destroy..() in gfx_hal takes exclusive ownership
 // of the object through self.
-struct ResourceHolder<Backend: gfx_hal::Backend>(ManuallyDrop<GpuResources<Backend>>);
+struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<GpuResources<B>>);
 
-impl<Backend: gfx_hal::Backend> Drop for ResourceHolder<Backend> {
+impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
     fn drop(&mut self) {
         unsafe {
             use gfx_hal::window::PresentationSurface;
@@ -68,12 +68,15 @@ fn read_shader(path: &str, default_options: bool) -> String {
     let mut objects: Vec<u8> = Vec::new();
 
     if default_options {
+        objects.append(&mut fs::read("shaders/options.glsl").unwrap());
+        objects.append(&mut vec![0xA]);
         objects.append(&mut fs::read(path).unwrap());
-        objects.append(&mut fs::read("../shaders/vertex.glsl").unwrap());
+
+        println!("{}", std::str::from_utf8(&objects).expect("Failed parsing"));
 
         String::from_utf8(objects).expect("Failed to parse utf-8 sequence")
     } else {
-        objects.append(&mut fs::read("../shaders/vertex.glsl").unwrap());
+        objects.append(&mut fs::read("shaders/vertex.glsl").unwrap());
 
         String::from_utf8(objects).expect("Failed to parse utf-8 sequence")
     }
@@ -89,7 +92,7 @@ pub unsafe fn generate_pipeline<T: gfx_hal::Backend>(
 ) -> T::GraphicsPipeline {
     use gfx_hal::pass::Subpass;
     use gfx_hal::pso::{
-        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
+        BlendState, ColorBlendDesc, ColorMask, EntryPoint, GraphicsPipelineDesc,
         InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Specialization,
     };
 
@@ -120,7 +123,11 @@ pub unsafe fn generate_pipeline<T: gfx_hal::Backend>(
     let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
         buffers: &[],
         attributes: &[],
-        input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+        input_assembler: InputAssemblerDesc {
+            primitive: Primitive::TriangleList,
+            with_adjacency: false,
+            restart_index: None,
+        },
         vertex: vs_entry,
         tessellation: None,
         geometry: None,
@@ -128,10 +135,7 @@ pub unsafe fn generate_pipeline<T: gfx_hal::Backend>(
 
     let mut pipeline_desc = GraphicsPipelineDesc::new(
         primitive_assembler,
-        Rasterizer {
-            cull_face: Face::BACK,
-            ..Rasterizer::FILL
-        },
+        Rasterizer::FILL,
         Some(fs_entry),
         pipeline_layout,
         Subpass {
@@ -202,6 +206,8 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
     let instance = backend::Instance::create(WINDOW_TITLE, 1).expect("Unsupported backend]");
     let surface = unsafe { instance.create_surface(&window)? };
     let adapter = instance.enumerate_adapters().remove(0);
+
+    println!("{:?}\n", adapter.info);
 
     let (device, mut queue_group) = {
         use gfx_hal::queue::QueueFamily;
@@ -278,8 +284,11 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
             preserves: &[],
         };
 
-        unsafe { device.create_render_pass(&[attachment], &[subpass], &[]) }
-            .expect("Failed to create render pass, possibly out of memory")
+        unsafe {
+            device
+                .create_render_pass(&[attachment], &[subpass], &[])
+                .expect("Out of memory")
+        }
     };
 
     // This defines textures and matrices required by the shaders, not required for
@@ -295,8 +304,8 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
             &device,
             &render_pass,
             &pipeline_layout,
-            &read_shader("../shaders/vertex.glsl", true)[..],
-            &read_shader("../shaders/fragment.glsl", true)[..],
+            &read_shader("shaders/vertex.glsl", true)[..],
+            &read_shader("shaders/fragment.glsl", true)[..],
         )
     };
 
@@ -436,6 +445,7 @@ pub fn renderwindow() -> Result<(), Box<dyn Error>> {
                         },
                         depth: 0.0..1.0,
                     };
+
                     unsafe {
                         use gfx_hal::command::{
                             ClearColor, ClearValue, CommandBuffer, CommandBufferFlags,
